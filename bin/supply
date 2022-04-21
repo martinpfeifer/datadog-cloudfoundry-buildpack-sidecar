@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# shellcheck disable=SC2034
+BUILD_DIR="${1}"
+# shellcheck disable=SC2034
+CACHE_DIR="${2}"
+DEPS_DIR="${3}"
+DEPS_IDX="${4}"
+
+BUILDPACK_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]%/*}")")"
+BIN_DIR="${DEPS_DIR}/${DEPS_IDX}/bin"
+PROFILED_DIR="${DEPS_DIR}/${DEPS_IDX}/profile.d"
+DATADOG_DIR="${DEPS_DIR}/${DEPS_IDX}/datadog"
+
+SIDECAR_CONFIG="${DEPS_DIR}/${DEPS_IDX}/launch.yml"
+
+RUNTIME_DATADOG_DIR="/home/vcap/deps/${DEPS_IDX}/datadog"
+RUNTIME_TMP_DIR="/home/vcap/tmp"
+
+LOGS_CONFIG_PORT="10514"
+
+mkdirs() {
+  mkdir -p "$BIN_DIR"
+  mkdir -p "$PROFILED_DIR"
+  mkdir -p "$DATADOG_DIR"
+}
+
+write_buildpack_config() {
+  cat > "${DEPS_DIR}/${DEPS_IDX}/config.yml" << EOF
+name: datadog-buildpack
+config: {}
+EOF
+}
+
+set_env_var() {
+  local key="$1"
+  local value="$2"
+
+  echo "export $key=\"$value\"" >> "$PROFILED_DIR"/01_env
+}
+
+add_sidecar() {
+  local type="$1"
+  local command="$2"
+  local memory_limit="$3"
+
+  if [[ -n ${SUPPRESS_DD_AGENT_OUTPUT:-} ]]; then
+    command="${command} > /dev/null 2>&1"
+  fi
+
+  # create launch.yml if none exists
+  if [[ ! -f $SIDECAR_CONFIG ]]; then
+  cat > "$SIDECAR_CONFIG" << EOF
+---
+processes:
+EOF
+  fi
+
+  cat >> "$SIDECAR_CONFIG" << EOF
+- type: "$type"
+  command: "$command"
+  limits:
+    memory: $memory_limit
+  platforms:
+    cloudfoundry:
+      sidecar_for:
+      - web
+      - worker
+EOF
+}
+
+write_datadog_yaml() {
+  cat > "$DATADOG_DIR"/datadog.yaml << EOF
+---
+run_path: $RUNTIME_TMP_DIR
+disable_file_logging: true
+EOF
+}
+
+write_tags_profiled_script() {
+  cp "$BUILDPACK_DIR"/lib/profile.d/tags.sh "$PROFILED_DIR"/02_tags
+}
+
+write_log_redirect_profiled_script() {
+  cat > "$PROFILED_DIR"/99_datadog << EOF
+case "\$2" in
+  trace-agent*) ;;
+  dogstatsd*) ;;
+  agent*) ;;
+  log-forwarder*) ;;
+  *) exec &> >(exec tee ${RUNTIME_DATADOG_DIR}/logs) ;;
+esac
+EOF
+}
+
+write_trace_agent_connection_test_profiled_script() {
+  local tries=6
+  local wait_time=5
+
+  cat > "$PROFILED_DIR"/03_trace_agent_connection_test << EOF
+case "\$2" in
+  trace-agent*) ;;
+  dogstatsd*) ;;
+  agent*) ;;
+  log-forwarder*) ;;
+  *)
+     i=0
+     while true; do
+       if [[ \$i -eq $tries ]]; then
+        echo "Timeout waiting on trace-agent" >&2
+        exit 1
+       fi
+
+       curl -sf --unix-socket \${DD_APM_RECEIVER_SOCKET} http://localhost/info > /dev/null \
+       && curl -sf http://localhost:${DD_APM_RECEIVER_PORT:-8126}/info > /dev/null \
+       && break
+
+       echo "Waiting on trace-agent" >&2
+       ((i=i+1))
+       sleep $wait_time
+     done
+     echo "trace-agent up" >&2
+  ;;
+esac
+EOF
+}
+
+write_logs_config() {
+  local logs_config_dir="${DATADOG_DIR}/conf.d/logs.d"
+
+  #if [[ -z ${DD_LOGS_CONFIG_SOURCE:-} ]]; then
+  #  echo "DD_LOGS_CONFIG_SOURCE is required" >&2
+  #  exit 1
+  #fi
+
+  if [[ -z ${DD_LOGS_CONFIG_SERVICE:-} ]]; then
+    DD_LOGS_CONFIG_SERVICE="$DD_SERVICE"
+  fi
+
+  mkdir -p "$logs_config_dir"
+  jq -n \
+    --arg port "${LOGS_CONFIG_PORT}" \
+    --arg source "${DD_LOGS_CONFIG_SOURCE:-}" \
+    --arg service "${DD_LOGS_CONFIG_SERVICE}" \
+    --arg tags "${DD_LOGS_CONFIG_TAGS:-}" \
+    '{
+      "logs":[
+        {
+          "type":"tcp",
+          "port":$port,
+          "source":$source,
+          "service":$service,
+          "tags":$tags | split(" ")
+        }
+      ]
+    }' > "${logs_config_dir}/config.yaml"
+}
+
+configure_agent() {
+  local agent_command="agent run --cfgpath ${RUNTIME_DATADOG_DIR}"
+  local forwarder_command="log-forwarder ${RUNTIME_DATADOG_DIR}/logs localhost ${LOGS_CONFIG_PORT}"
+
+  cp "$BUILDPACK_DIR"/lib/agent "$BIN_DIR"/
+  cp "$BUILDPACK_DIR"/lib/log-forwarder "$BIN_DIR"/log-forwarder
+
+  set_env_var "DD_CONFD_PATH" "${RUNTIME_DATADOG_DIR}/conf.d"
+  set_env_var "DD_LOG_FILE" "${RUNTIME_TMP_DIR}/agent.log"
+  #set_env_var "DD_DOGSTATSD_PORT" "${DD_DOGSTATSD_PORT:-0}"
+  set_env_var "DD_DOGSTATSD_SOCKET" "${RUNTIME_DATADOG_DIR}/dogstatsd.sock"
+  add_sidecar "agent" "$agent_command" 45
+
+  if [[ ${DD_LOGS_ENABLED:-} = "true" ]]; then
+    mkfifo "$DATADOG_DIR"/logs
+    write_logs_config
+    write_log_redirect_profiled_script
+    set_env_var "DD_LOGS_CONFIG_RUN_PATH" "$RUNTIME_TMP_DIR"
+    add_sidecar "log-forwarder" "$forwarder_command" 5
+  fi
+}
+
+configure_dogstatsd() {
+  local command="dogstatsd start --cfgpath ${RUNTIME_DATADOG_DIR}"
+
+  cp "$BUILDPACK_DIR"/lib/dogstatsd "$BIN_DIR"/
+  cp "$DATADOG_DIR"/datadog.yaml "$DATADOG_DIR"/dogstatsd.yaml
+
+  set_env_var "DD_LOG_FILE" "${RUNTIME_TMP_DIR}/dogstatsd.log"
+  #set_env_var "DD_DOGSTATSD_PORT" "${DD_DOGSTATSD_PORT:-0}"
+  set_env_var "DD_DOGSTATSD_SOCKET" "${RUNTIME_DATADOG_DIR}/dogstatsd.sock"
+  add_sidecar "dogstatsd" "$command" 20
+}
+
+configure_trace_agent() {
+  local command="trace-agent --config ${RUNTIME_DATADOG_DIR}/datadog.yaml -logtostderr"
+
+  cp "$BUILDPACK_DIR"/lib/trace-agent "$BIN_DIR"/
+  write_trace_agent_connection_test_profiled_script
+
+  #set_env_var "DD_APM_LOG_FILE" "${RUNTIME_TMP_DIR}/trace-agent.log"
+  set_env_var "DD_APM_LOG_FILE" "/dev/null"
+  set_env_var "DD_APM_RECEIVER_SOCKET" "${RUNTIME_DATADOG_DIR}/trace-agent.sock"
+  add_sidecar "trace-agent" "$command" 30
+}
+
+
+echo "-----> Datadog Buildpack"
+
+mkdirs
+write_buildpack_config
+write_datadog_yaml
+write_tags_profiled_script
+
+if [[ ${DD_APM_ENABLED:-true} = "true" ]]; then
+  configure_trace_agent
+  configure_agent
+elif [[ ${DD_LOGS_ENABLED:-} = "true" ]]; then
+  configure_agent
+else
+  configure_dogstatsd
+fi

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+
+echo "-----> DatadogBuildpack"
+echo "bin/compile is deprecated" >&2
+exit 1
